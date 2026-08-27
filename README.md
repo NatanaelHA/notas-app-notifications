@@ -1,11 +1,11 @@
 # Notas App — Servicio de notificaciones
 
-Backend serverless responsable del envío de notificaciones por correo de **Notas App**. Consume mensajes desde Amazon SQS y utiliza Amazon SES para enviar un correo cuando un usuario registrado crea una nota.
+Backend serverless responsable del envío de notificaciones por correo de **Notas App**. Consume desde Amazon SQS los resúmenes de notas de invitados vencidos y utiliza Amazon SES para enviarlos al correo de auditoría.
 
 Este repositorio forma parte de una arquitectura separada por servicios:
 
 - [`notas-app-frontend`](https://github.com/NatanaelHA/notas-app-frontend): interfaz web.
-- [`notas-app-backend`](https://github.com/NatanaelHA/notas-app-backend): notas, DynamoDB, S3 y publicación de mensajes en SQS.
+- [`notas-app-backend`](https://github.com/NatanaelHA/notas-app-backend): notas, DynamoDB, S3 y publicación de resúmenes en SQS.
 - [`notas-app-usuarios`](https://github.com/NatanaelHA/notas-app-usuarios): usuarios invitados y Cognito.
 - [`notas-app-notifications`](https://github.com/NatanaelHA/notas-app-notifications): notificaciones por correo (este repositorio).
 
@@ -14,8 +14,9 @@ Este repositorio forma parte de una arquitectura separada por servicios:
 Este servicio es responsable de:
 
 - Consumir solicitudes de correo desde la cola SQS `notas-emails`.
-- Ignorar el envío real para cuentas invitadas y registrar una simulación en CloudWatch.
-- Enviar mediante SES un correo a los usuarios registrados cuando crean una nota.
+- Validar que el mensaje recibido sea de tipo `resumen_invitado`.
+- Formatear las notas activas que conservaba el invitado vencido.
+- Enviar mediante SES el resumen al correo de auditoría.
 - Permitir que SQS reintente los mensajes cuando el procesamiento falla.
 - Trabajar con la cola de mensajes fallidos `notas-emails-fallidos` configurada como DLQ de la cola principal.
 
@@ -24,19 +25,15 @@ Este servicio **no** crea notas, administra usuarios ni expone endpoints HTTP.
 ## Arquitectura
 
 ```text
-Frontend
-    ↓ crea una nota
-API Gateway
-    ↓
-crearNota, en notas-app-backend
-    ↓ publica un mensaje
+eliminarNotasInvitado, en notas-app-backend
+    ↓ publica resumen_invitado
 SQS (notas-emails)
     ↓ activa la Lambda
 mailer, en notas-app-notifications
+    ↓ formatea el resumen
+Amazon SES
     ↓
-SES
-    ↓
-Correo del usuario
+Correo de auditoría
 ```
 
 `mailer` no consulta DynamoDB ni llama al servicio de notas. Toda la información necesaria para generar el correo viaja dentro del mensaje de SQS.
@@ -50,7 +47,7 @@ Procesamiento exitoso
 → SQS elimina el mensaje de notas-emails
 ```
 
-Si el JSON es inválido o SES devuelve un error, la Lambda termina con error y SQS conserva el mensaje para volver a entregarlo después del tiempo de visibilidad.
+Si el JSON es inválido, el tipo no es compatible o SES devuelve un error, la Lambda termina con error y SQS conserva el mensaje para volver a entregarlo después del tiempo de visibilidad.
 
 ```text
 Procesamiento fallido
@@ -72,14 +69,14 @@ La política de redirección, el tiempo de visibilidad y `maxReceiveCount` está
 |---|---|
 | AWS Lambda | Ejecuta la función `mailer`. |
 | Amazon SQS | Entrega solicitudes de correo y administra sus reintentos. |
-| Amazon SES | Realiza el envío del correo. |
+| Amazon SES | Envía el resumen al correo de auditoría. |
 | Amazon CloudWatch | Registra logs y métricas de la Lambda. |
 
 ## Lambda
 
 | Función | Activación | Descripción |
 |---|---|---|
-| `mailer` | Trigger de SQS | Procesa mensajes de `notas-emails` y envía correos mediante SES. |
+| `mailer` | Trigger de SQS | Procesa mensajes `resumen_invitado` de `notas-emails`, formatea las notas y solicita su envío a SES. |
 
 Este backend no utiliza `response.js` porque la función no es invocada por API Gateway. El resultado se comunica de esta forma:
 
@@ -92,42 +89,42 @@ El servicio de notas publica mensajes con esta estructura:
 
 ```json
 {
-  "userId": "sub-del-usuario",
-  "email": "usuario@ejemplo.com",
-  "titulo": "Título de la nota",
-  "noteId": "id-de-la-nota",
-  "esInvitado": false
+  "tipo": "resumen_invitado",
+  "userId": "sub-del-invitado",
+  "email": "correo-de-auditoria-verificado-en-ses@ejemplo.com",
+  "notas": [
+    {
+      "noteId": "id-de-la-nota",
+      "titulo": "Título de la nota",
+      "cuerpo": "Contenido",
+      "creadoEn": "2026-08-25T02:14:32.687Z"
+    }
+  ]
 }
 ```
 
 `mailer` utiliza:
 
-- `email`: destinatario del correo.
-- `titulo`: título incluido en el cuerpo del mensaje.
-- `noteId`: identificador incluido en el correo y los logs.
-- `esInvitado`: evita enviar correos reales a cuentas temporales.
+- `tipo`: identifica el flujo que debe procesar; actualmente solo admite `resumen_invitado`.
+- `userId`: identifica al invitado en el cuerpo del correo y en los logs.
+- `email`: indica el correo de auditoría al que SES debe enviar el resumen.
+- `notas`: contiene las notas activas recopiladas antes de eliminarlas de DynamoDB.
 
-Actualmente `userId` forma parte del contrato, aunque `mailer` no lo utiliza directamente.
-
-## Comportamiento para invitados
-
-Si `esInvitado` es `true`, la función no llama a SES. Registra en CloudWatch:
-
-```text
-[SIMULADO] Email NO enviado a invitado (...)
-```
-
-El mensaje se considera procesado correctamente y SQS lo elimina de la cola.
+Un mensaje sin tipo o con un tipo no soportado provoca un error. De esta forma SQS puede reintentarlo y, si el problema persiste, conservarlo en `notas-emails-fallidos` en lugar de descartarlo silenciosamente.
 
 ## Correo enviado
 
-Para usuarios registrados, el correo contiene:
+El correo contiene:
 
-- Asunto: `Nueva nota creada`.
-- Destinatario: el correo recibido desde SQS.
-- Contenido: título e identificador de la nota.
+- Asunto: `Resumen de notas de invitado expirado`.
+- Destinatario: el correo de auditoría recibido desde SQS.
+- Cantidad de notas activas.
+- `userId` del invitado en el cuerpo del correo.
+- Por cada nota: título, identificador, fecha de creación, fecha de actualización si existe y contenido.
 
-El remitente debe estar autorizado para enviar mediante SES en la región `us-east-1`.
+Los adjuntos y las URLs prefirmadas de S3 no forman parte del resumen actual.
+
+El remitente y, mientras SES permanezca en sandbox, el destinatario deben estar verificados en la región `us-east-1`.
 
 ## Estructura del proyecto
 
