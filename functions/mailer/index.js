@@ -33,9 +33,9 @@ const formatearResumenInvitado = (userId, notas) => {
 /* USUARIOS REALES                                                           */
 /* ------------------------------------------------------------------------- */
 
-const formatearResumenUsuario = (notas) => {
+const formatearResumenUsuario = (userId, notas) => {
   return [
-    'Resumen semanal de tus notas',
+    `Resumen semanal del usuario: ${userId}`,
     `Cantidad de notas activas: ${notas.length}`,
     '',
     formatearDetalleNotas(notas),
@@ -54,8 +54,8 @@ exports.handler = async (event) => {
       cuerpo = formatearResumenInvitado(mensaje.userId, mensaje.notas)
       descripcionLog = `invitado ${mensaje.userId}`
     } else if (mensaje.tipo === 'resumen_usuario') {
-      asunto = 'Resumen semanal de tus notas'
-      cuerpo = formatearResumenUsuario(mensaje.notas)
+      asunto = 'Auditoría semanal de notas de usuario'
+      cuerpo = formatearResumenUsuario(mensaje.userId, mensaje.notas)
       descripcionLog = `usuario ${mensaje.userId}`
     } else {
       throw new Error(`Tipo de mensaje no soportado: ${mensaje.tipo || 'sin tipo'}`)
